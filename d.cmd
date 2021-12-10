@@ -1,0 +1,1 @@
+arm-none-eabi-gdb.exe -x openocd.gdb C:\Users\USER\rust_proj\sim800_ups_monitor\target\thumbv7m-none-eabi\debug\sim800_ups_monitor

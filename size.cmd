@@ -1,0 +1,1 @@
+cargo size --bin sim800_ups_monitor --release -- -A

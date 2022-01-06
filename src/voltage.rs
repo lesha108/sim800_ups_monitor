@@ -46,7 +46,7 @@ impl V220Control {
         for _ in 0..8 {
             let data: u16 = self.adc.read(&mut self.analog_input).unwrap();
             //3.3d = 4095, 3.3/2 = 2036
-            averaged += data as u32;
+            averaged += u32::from(data);
         }
         self.voltage = averaged as f32 / 8.0 / 4096.0 * VCC;
         self.voltage
@@ -73,14 +73,16 @@ impl Eeprom for V220Control {
         if self.state != State::ColdStart {
             return;
         }
-        let read_data = ctx.eeprom.read_byte(self.address as u32).unwrap();
+        let address = u32::from(self.address);
+        let read_data = ctx.eeprom.read_byte(address).unwrap();
         self.state = State::from(read_data);
     }
 
     /// запись состояния в EEPROM
     fn save(&mut self, ctx: &mut Context) -> Result<(), ()> {
+        let address = u32::from(self.address);
         let data = self.state.into();
-        ctx.save_byte(self.address as u32, data)
+        ctx.save_byte(address, data)
     }
 }
 
@@ -146,7 +148,7 @@ impl Battery {
         for _ in 0..8 {
             let data: u16 = self.adc.read(&mut self.analog_input).unwrap();
             //3.3d = 4095, 3.3/2 = 2036
-            averaged += data as u32;
+            averaged += u32::from(data);
         }
         self.voltage = averaged as f32 / 8.0 / 4096.0 * VCC;
         self.voltage

@@ -118,16 +118,16 @@ impl<PINS> Sim800<PINS> {
     pub fn send_sms(&mut self, ctx: &mut Context, msg: &[u8]) -> Result<(), ()> {
         let mut reply = Err(());
         let mut buf: Vec<u8, 160> = Vec::new();
-        write!(
+        writeln!(
             buf,
-            "AT+CMGS=\"{}\"\n",
+            r#"AT+CMGS="{}""#,
             core::str::from_utf8(self.get_active_num()).unwrap()
         )
         .unwrap();
         let _ = self.send_at_cmd_wait_resp(ctx, buf.as_slice(), 100, 10);
         if self.buf_contains(b">").is_ok() {
             buf.clear();
-            write!(buf, "{}\u{001a}", core::str::from_utf8(&msg).unwrap()).unwrap();
+            write!(buf, "{}\u{001a}", core::str::from_utf8(msg).unwrap()).unwrap();
             writeln!(
                 ctx.console,
                 "sms msg = {}",
@@ -231,7 +231,7 @@ impl<PINS> Sim800<PINS> {
                 }
             }
         }
-        if self.rcv_buf.len() == 0 {
+        if self.rcv_buf.is_empty() {
             // ничего не смогли получить
             writeln!(ctx.console, "NO RING").unwrap();
             let _ = self.gsm_busy(ctx, true); // block GSM RINGs
@@ -406,7 +406,7 @@ impl<PINS> Sim800<PINS> {
                 }
             }
         }
-        if self.rcv_buf.len() == 0 {
+        if self.rcv_buf.is_empty() {
             // ничего не смогли получить
             writeln!(ctx.console, "SIM nrsp").unwrap();
             return Err(());

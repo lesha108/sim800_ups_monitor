@@ -7,15 +7,23 @@ use stm32f1xx_hal::{delay::Delay, pwm::Channel, rtc::Rtc, watchdog::IndependentW
 
 /// Определение структуры аппаратного контекста
 pub struct Context {
+    /// сторожевой таймер
     pub watchdog: IndependentWatchdog,
+    /// функции задержки
     pub delay: Delay,
+    /// таймер отслеживания таймаутов в последовательных портах
     pub at_timer: CountDownTimer<pac::TIM3>,
+    /// часы реального времени
     pub rtc: Rtc,
+    /// последовательный порт отладочной печати
     pub console: Tx<pac::USART2>,
+
+    /// heartbeat LED
     pub led: stm32f1xx_hal::gpio::gpioc::PC13<
         stm32f1xx_hal::gpio::Output<stm32f1xx_hal::gpio::PushPull>,
     >,
 
+    /// доступ к EEPROM
     pub eeprom: eeprom24x::Eeprom24x<
         stm32f1xx_hal::i2c::BlockingI2c<
             stm32f1xx_hal::pac::I2C1,
@@ -32,6 +40,7 @@ pub struct Context {
         eeprom24x::addr_size::OneByte,
     >,
 
+    /// функции пищалки
     pub beeper: stm32f1xx_hal::pwm::Pwm<
         stm32f1xx_hal::pac::TIM1,
         stm32f1xx_hal::timer::Tim1NoRemap,

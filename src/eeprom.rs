@@ -29,7 +29,7 @@ impl Into<u8> for EepromAdresses {
 impl Into<u32> for EepromAdresses {
     fn into(self) -> u32 {
         let r: u8 = Self::into(self);
-        r as u32
+        u32::from(r)
     }
 }
 
@@ -43,7 +43,7 @@ pub enum State {
 impl From<u8> for State {
     fn from(value: u8) -> Self {
         match value {
-            0 => State::ColdStart,
+            // 0 => State::ColdStart,
             1 => State::Monitoring,
             2 => State::WaitForNormal,
             _ => State::ColdStart,

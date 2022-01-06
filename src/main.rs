@@ -18,8 +18,8 @@ use core::sync::atomic::Ordering;
 use cortex_m_rt::entry;
 use eeprom24x::{Eeprom24x, SlaveAddr};
 use embedded_hal::blocking::delay::DelayMs;
-use heapless::*;
-use one_wire_bus::*;
+use heapless::Vec;
+use one_wire_bus::OneWire;
 use panic_halt as _;
 use stm32f1xx_hal::{
     adc,
@@ -47,6 +47,7 @@ use crate::ups::Ups;
 use crate::voltage::{Battery, V220Control};
 
 /// Определяем входную функцию
+#[allow(clippy::empty_loop)]
 #[entry]
 fn main() -> ! {
     //Show "Hello, world!" on the debug console, which is shown in OpenOCD
@@ -116,7 +117,7 @@ fn main() -> ! {
             dp.USART2,
             (tx, rx),
             &mut afio.mapr,
-            Config::default().baudrate(115200.bps()),
+            Config::default().baudrate(115_200.bps()),
             clocks,
             &mut rcc.apb1,
         );
@@ -210,14 +211,14 @@ fn main() -> ! {
 
     // создаём переменную с контекстом, которую будем передавать в другие функции
     let mut ctx = Context {
-        watchdog, // сторожевой таймер
-        delay,    // функции задержки
-        at_timer, // таймер отслеживания таймаутов в последовательных портах
-        rtc,      // часы реального времени
-        console,  // последовательный порт отладочной печати
-        eeprom,   // доступ к EEPROM
-        beeper,   // функции пищалки
-        led,      // heartbeat LED
+        watchdog,
+        delay,
+        at_timer,
+        rtc,
+        console,
+        led,
+        eeprom,
+        beeper,
     };
     // Гудок при старте контроллера
     ctx.beep();
@@ -254,7 +255,7 @@ fn main() -> ! {
     // объект контроля температуры DS18B20
     let mut temp_control = TempControl::new(one_wire_bus);
     temp_control.load(&mut ctx);
-    temp_control.measure(&mut ctx);
+    let _ = temp_control.measure(&mut ctx);
 
     loop {
         // сбрасываем сторожевой таймер
@@ -309,7 +310,7 @@ fn main() -> ! {
             // получить данные о температуре чипа
             v220control.measure_temp();
             // температура DS18B20
-            temp_control.measure(&mut ctx);
+            let _ = temp_control.measure(&mut ctx);
             // получить строку состояния UPS
             let _ = ups.measure(&mut ctx);
             // получить данные о напряжении батареи МК при напряжении питания 3.3в
@@ -326,15 +327,10 @@ fn main() -> ! {
 
         // проверка необходимости отправки ежедневного статус СМС
         let mut need_sms = false;
-        let alarm = ctx.rtc.wait_alarm();
-        match alarm {
-            Err(nb::Error::Other(_)) => {}
-            Err(nb::Error::WouldBlock) => {}
-            Ok(_) => {
-                writeln!(ctx.console, "Alarm triggered").unwrap();
-                need_sms = true;
-                ctx.reset_rtc();
-            }
+        if ctx.rtc.wait_alarm().is_ok() {
+            writeln!(ctx.console, "Alarm triggered").unwrap();
+            need_sms = true;
+            ctx.reset_rtc();
         }
 
         // 10 секунд ждем входящего звонка и при этом мигаем светодиодом
@@ -354,14 +350,14 @@ fn main() -> ! {
             let ups_ans = ups.get_ups();
 
             let mut sms_message: Vec<u8, 160> = Vec::new();
-            write!(sms_message, "T1={}C\n", temp_int).unwrap();
-            write!(sms_message, "T2={0:.1}C\n", temp_ext).unwrap();
-            write!(sms_message, "V220={0:.2}V\n", v220).unwrap();
-            write!(sms_message, "V12={0:.2}V\n", batt).unwrap();
+            writeln!(sms_message, "T1={}C", temp_int).unwrap();
+            writeln!(sms_message, "T2={0:.1}C", temp_ext).unwrap();
+            writeln!(sms_message, "V220={0:.2}V", v220).unwrap();
+            writeln!(sms_message, "V12={0:.2}V", batt).unwrap();
             write!(
                 sms_message,
                 "UPS={}",
-                core::str::from_utf8(&ups_ans).unwrap()
+                core::str::from_utf8(ups_ans).unwrap()
             )
             .unwrap();
 

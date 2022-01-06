@@ -61,35 +61,30 @@ impl<PINS> Ups<PINS> {
                 }
                 Err(nb::Error::WouldBlock) => {
                     // символ не пришёл ещё
-                    let t = ctx.at_timer.wait();
-                    match t {
-                        Err(nb::Error::Other(_)) => {
-                            writeln!(ctx.console, "UPS e2").unwrap();
-                            break;
-                        }
-                        Err(nb::Error::WouldBlock) => {
-                            // просто ждём ещё таймер
-                            continue;
-                        }
+                    match ctx.at_timer.wait() {
                         Ok(_) => {
                             // сработал таймер отсчёта таймаута
                             if got_first_char {
                                 // отрабатываем ожидание последнего символа
                                 if w2_cycles >= TIMEOUT_LAST_CYCLES {
                                     break; // вылет по таймауту
-                                } else {
-                                    w2_cycles += 1;
-                                    continue;
                                 }
                             } else {
                                 // отрабатываем ожидание первого символа
                                 if w1_cycles >= TIMEOUT_FIRST_CYCLES {
                                     break;
-                                } else {
-                                    w1_cycles += 1;
-                                    continue;
                                 }
                             }
+                            w2_cycles += 1;
+                            continue;
+                        }
+                        Err(nb::Error::WouldBlock) => {
+                            // просто ждём ещё таймер
+                            continue;
+                        }
+                        Err(nb::Error::Other(_)) => {
+                            writeln!(ctx.console, "UPS e2").unwrap();
+                            break;
                         }
                     }
                 }

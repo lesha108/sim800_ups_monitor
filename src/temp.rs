@@ -1,5 +1,6 @@
 use core::fmt::Write;
 use ds18b20::{Ds18b20, Resolution};
+use one_wire_bus::OneWireResult;
 
 use crate::context::Context;
 use crate::eeprom::{Eeprom, EepromAdresses, State};
@@ -35,71 +36,58 @@ impl TempControl {
         }
     }
 
-    /// измерение температуры
-    pub fn measure(&mut self, ctx: &mut Context) -> f32 {
-        let w1 =
-            ds18b20::start_simultaneous_temp_measurement(&mut self.one_wire_bus, &mut ctx.delay);
-
-        return match w1 {
-            Err(_) => {
-                writeln!(ctx.console, "OW e1").unwrap();
-                -101.0
-            }
-            Ok(_) => {
-                Resolution::Bits12.delay_for_measurement_time(&mut ctx.delay);
-                let search_state = None;
-                let w2 =
-                    self.one_wire_bus
-                        .device_search(search_state.as_ref(), false, &mut ctx.delay);
-                match w2 {
-                    Err(_) => {
-                        writeln!(ctx.console, "OW e2").unwrap();
-                        -102.0
-                    }
-                    Ok(None) => {
-                        writeln!(ctx.console, "OW none").unwrap();
-                        -103.0
-                    }
-                    Ok(Some((device_address, _state))) => {
-                        // search_state = Some(state); // у нас только один датчик, дальше не ищем
-                        if device_address.family_code() == ds18b20::FAMILY_CODE {
-                            let w0: core::result::Result<
-                                ds18b20::Ds18b20,
-                                one_wire_bus::OneWireError<core::convert::Infallible>,
-                            > = Ds18b20::new(device_address);
-                            match w0 {
-                                Err(_) => {
-                                    writeln!(ctx.console, "OW e5").unwrap();
-                                    -104.0
-                                }
-                                Ok(sensor) => {
-                                    let w3 =
-                                        sensor.read_data(&mut self.one_wire_bus, &mut ctx.delay);
-                                    match w3 {
-                                        Err(_) => {
-                                            writeln!(ctx.console, "OW e4").unwrap();
-                                            -105.0
-                                        }
-                                        Ok(sensor_data) => {
-                                            //writeln!(console, "Device at {:?} is {}C", device_address, sensor_data.temperature);
-                                            self.temp = sensor_data.temperature;
-                                            self.temp
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            writeln!(ctx.console, "OW e3").unwrap();
-                            -106.0
-                        }
-                    }
-                }
-            }
-        };
-    }
-
     pub fn get_temp(&mut self) -> f32 {
         self.temp
+    }
+
+    /// измерение температуры
+    pub fn measure(&mut self, ctx: &mut Context) -> Result<(), u8> {
+        if let Err(e) = Self::inter_measure(self, ctx) {
+            writeln!(ctx.console, "e{}", e).unwrap();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn inter_measure(&mut self, ctx: &mut Context) -> Result<(), u8> {
+        let w1 =
+            ds18b20::start_simultaneous_temp_measurement(&mut self.one_wire_bus, &mut ctx.delay);
+        if w1.is_err() {
+            return Err(1);
+        }
+        Resolution::Bits12.delay_for_measurement_time(&mut ctx.delay);
+        let search_state = None;
+        let w0 = self
+            .one_wire_bus
+            .device_search(search_state.as_ref(), false, &mut ctx.delay);
+        match w0 {
+            Ok(Some((device_address, _state))) => {
+                // search_state = Some(state); // у нас только один датчик, дальше не ищем
+                if device_address.family_code() != ds18b20::FAMILY_CODE {
+                    return Err(4);
+                }
+                let w0: core::result::Result<
+                    ds18b20::Ds18b20,
+                    one_wire_bus::OneWireError<core::convert::Infallible>,
+                > = Ds18b20::new(device_address);
+                match w0 {
+                    Ok(sensor) => {
+                        let w3 = sensor.read_data(&mut self.one_wire_bus, &mut ctx.delay);
+                        match w3 {
+                            Ok(sensor_data) => {
+                                //writeln!(console, "Device at {:?} is {}C", device_address, sensor_data.temperature);
+                                self.temp = sensor_data.temperature;
+                                Ok(())
+                            }
+                            Err(_) => Err(5),
+                        }
+                    }
+                    Err(_) => Err(4),
+                }
+            }
+            Ok(None) => Err(2),
+            Err(_) => Err(3),
+        }
     }
 }
 
@@ -109,14 +97,16 @@ impl Eeprom for TempControl {
         if self.state != State::ColdStart {
             return;
         }
-        let read_data = ctx.eeprom.read_byte(self.address as u32).unwrap();
+        let address = u32::from(self.address);
+        let read_data = ctx.eeprom.read_byte(address).unwrap();
         self.state = read_data.into();
     }
 
     /// запись состояния в EEPROM
     fn save(&mut self, ctx: &mut Context) -> Result<(), ()> {
+        let address = u32::from(self.address);
         let data = self.state.into();
-        ctx.save_byte(self.address as u32, data)
+        ctx.save_byte(address, data)
     }
 }
 
@@ -124,7 +114,7 @@ impl Observable for TempControl {
     fn check<PINS>(&mut self, ctx: &mut Context, sim: &mut Sim800<PINS>) -> Result<(), ()> {
         match self.state {
             State::ColdStart => {
-                self.measure(ctx);
+                let _ = self.measure(ctx);
                 self.state = State::Monitoring;
             }
             State::Monitoring => {

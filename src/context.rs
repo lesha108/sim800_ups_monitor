@@ -5,8 +5,6 @@ use stm32f1xx_hal::serial::Tx;
 use stm32f1xx_hal::timer::CountDownTimer;
 use stm32f1xx_hal::{delay::Delay, pwm::Channel, rtc::Rtc, watchdog::IndependentWatchdog};
 
-use crate::{Observable, Sim800};
-
 /// Определение структуры аппаратного контекста
 pub struct Context {
     pub watchdog: IndependentWatchdog,
@@ -69,10 +67,5 @@ impl Context {
         self.rtc.set_time(0);
         // Запустить через сутки
         self.rtc.set_alarm(24 * 60 * 60);
-    }
-
-    #[must_use]
-    pub fn check<O: Observable>(&mut self, control: &mut O, sim: &mut Sim800) -> bool {
-        control.check(self, sim)
     }
 }

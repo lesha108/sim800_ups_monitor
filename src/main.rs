@@ -4,6 +4,8 @@
 
 mod context;
 mod interrupts;
+mod sim;
+mod traits;
 mod ups;
 
 use stm32f1xx_hal::prelude::*;
@@ -14,9 +16,7 @@ use cortex_m_rt::entry;
 use ds18b20::*;
 use eeprom24x::{Eeprom24x, SlaveAddr};
 use embedded_hal::blocking::delay::DelayMs;
-use embedded_hal::digital::v2::OutputPin;
 use heapless::*;
-use nb::block;
 use one_wire_bus::*;
 use panic_halt as _;
 use stm32f1xx_hal::{
@@ -36,7 +36,9 @@ use stm32f1xx_hal::{
 //use cortex_m_semihosting::hio;  //  For displaying messages on the debug console.
 
 use crate::context::Context;
-use crate::interrupts::{SEC_COUNT_LED, SEC_COUNT_REBOOT, SEC_COUNT_SENSOR, SEC_TIMER};
+use crate::interrupts::{SEC_COUNT_REBOOT, SEC_COUNT_SENSOR, SEC_TIMER};
+use crate::sim::Sim800;
+use crate::traits::Observable;
 use crate::ups::Ups;
 
 /// Определяем входную функцию
@@ -244,17 +246,18 @@ fn main() -> ! {
             .downgrade();
         OneWire::new(one_wire_pin).unwrap()
     };
-    // объект контроля темперетуры DS18B20
+    // объект контроля температуры DS18B20
     let mut temp_control = TempControl::new(one_wire_bus);
     temp_control.load(&mut ctx);
     temp_control.measure(&mut ctx);
 
     loop {
-        ctx.watchdog.feed(); // сбрасываем сторожевой таймер
-                             // проверяем связь с SIM800L Если нет, то пробуем перегрузить SIM800
-                             // если не помогает перезагрузка, пробуем перегрузить микроконтроллер
-        let chk = sim800.check_com(&mut ctx);
-        if !chk {
+        // сбрасываем сторожевой таймер
+        ctx.watchdog.feed();
+
+        // проверяем связь с SIM800L Если нет, то пробуем перегрузить SIM800
+        // если не помогает перезагрузка, пробуем перегрузить микроконтроллер
+        if sim800.check_com(&mut ctx).is_err() {
             writeln!(ctx.console, "SIM com failed. SIM800 Reboot").unwrap();
             sim800.reboot(&mut ctx);
             for _ in 0..10 {
@@ -275,8 +278,7 @@ fn main() -> ! {
         }
 
         // проверяем регистрацию модуля в сети
-        let reg_chk = sim800.check_reg(&mut ctx);
-        if !reg_chk {
+        if sim800.check_reg(&mut ctx).is_err() {
             writeln!(ctx.console, "No network").unwrap();
             let cnt = SEC_COUNT_REBOOT.load(Ordering::Relaxed);
             if cnt > 30 * 60 {
@@ -310,10 +312,8 @@ fn main() -> ! {
         }
 
         // проверка диапазонов значений температуры и напряжения
-        //v220control.check(&mut ctx, &mut sim800);
-        //temp_control.check(&mut ctx, &mut sim800);
-        ctx.check(&mut v220control, &mut sim800);
-        ctx.check(&mut temp_control, &mut sim800);
+        v220control.check(&mut ctx, &mut sim800);
+        temp_control.check(&mut ctx, &mut sim800);
 
         // проверка необходимости отправки ежедневного статус СМС
         let mut need_sms = false;
@@ -329,7 +329,7 @@ fn main() -> ! {
         }
 
         // 10 секунд ждем входящего звонка и при этом мигаем светодиодом
-        if sim800.call_detect(&mut ctx) {
+        if sim800.call_detect(&mut ctx).is_ok() {
             writeln!(ctx.console, "Auth call detected!").unwrap();
             need_sms = true;
             ctx.reset_rtc();
@@ -367,580 +367,6 @@ fn main() -> ! {
 }
 
 //--------------------------------------------------------------
-// Функции работы с SIM800L
-//--------------------------------------------------------------
-
-const SIM800_NUMBER_LEN: usize = 40;
-// длина буфера телефонного номера SIM800
-const SIM800_RCV_BUF_LEN: usize = 1600; // длина буфера приёма данных от SIM800
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ComStates {
-    Initial,
-    // не установлена связь с модулем
-    Connected,
-    // связь с модулем есть, нет регистрации в сети
-    Registered, // модуль зарегистрирован в сети
-}
-
-struct Sim800 {
-    state: ComStates,
-    rcv_buf: Vec<u8, SIM800_RCV_BUF_LEN>,
-    auth: Vec<Vec<u8, SIM800_NUMBER_LEN>, 3>,
-    active_num: u8,
-    sim800_port: stm32f1xx_hal::serial::Serial<
-        stm32f1xx_hal::pac::USART3,
-        (
-            stm32f1xx_hal::gpio::gpiob::PB10<
-                stm32f1xx_hal::gpio::Alternate<stm32f1xx_hal::gpio::PushPull>,
-            >,
-            stm32f1xx_hal::gpio::gpiob::PB11<
-                stm32f1xx_hal::gpio::Input<stm32f1xx_hal::gpio::Floating>,
-            >,
-        ),
-    >,
-    sim_reset_pin: stm32f1xx_hal::gpio::gpioa::PA6<
-        stm32f1xx_hal::gpio::Output<stm32f1xx_hal::gpio::OpenDrain>,
-    >,
-}
-
-impl Sim800 {
-    fn new(
-        port: stm32f1xx_hal::serial::Serial<
-            stm32f1xx_hal::pac::USART3,
-            (
-                stm32f1xx_hal::gpio::gpiob::PB10<
-                    stm32f1xx_hal::gpio::Alternate<stm32f1xx_hal::gpio::PushPull>,
-                >,
-                stm32f1xx_hal::gpio::gpiob::PB11<
-                    stm32f1xx_hal::gpio::Input<stm32f1xx_hal::gpio::Floating>,
-                >,
-            ),
-        >,
-        pin: stm32f1xx_hal::gpio::gpioa::PA6<
-            stm32f1xx_hal::gpio::Output<stm32f1xx_hal::gpio::OpenDrain>,
-        >,
-    ) -> Sim800 {
-        Sim800 {
-            state: ComStates::Initial,
-            rcv_buf: Vec::new(),
-            auth: Vec::new(), // allowed phone numbers
-            active_num: 0,
-            sim800_port: port,
-            sim_reset_pin: pin,
-        }
-    }
-
-    // номер, на который будут отправляться СМС
-    fn get_active_num(&mut self) -> &[u8] {
-        &self.auth[(self.active_num - 1) as usize][..]
-    }
-
-    // поиск подстроки в буфере приёма
-    fn buf_contains(&mut self, pattern: &[u8]) -> bool {
-        let psize = pattern.len();
-        let bsize = self.rcv_buf.len();
-        for i in 0..bsize {
-            let rlimit = i + psize;
-            if rlimit > bsize {
-                break;
-            }
-            let sl = &self.rcv_buf[i..rlimit];
-            if sl == pattern {
-                return true;
-            }
-        }
-        false
-    }
-
-    // отправка АТ команды и получение ответа от SIM800
-    fn send_at_cmd_wait_resp(
-        &mut self,
-        ctx: &mut Context,
-        at_cmd: &[u8], // команда
-        toc: u16,      // timeout for first char
-        to: u16,
-    ) -> bool {
-        // читаем мусор из порта
-        loop {
-            let res = self.sim800_port.read();
-            match res {
-                Err(nb::Error::Other(_)) => {
-                    writeln!(ctx.console, "SIM e0").unwrap();
-                    break;
-                }
-                Err(nb::Error::WouldBlock) => {
-                    // к счастью ничего нет
-                    break;
-                }
-                Ok(_) => {} // если что, перезагрузится по сторожевому таймеру
-            }
-        }
-        // отправляем команду
-        for cmd in at_cmd {
-            block!(self.sim800_port.write(*cmd)).ok();
-        }
-        // пробуем получить ответ
-        self.rcv_buf.clear();
-        ctx.at_timer.reset(); // reset timeout counter
-        let mut got_first_char = false; // признак, что получили что-то из порта
-        let mut w1_cycles = 0; // циклов задержки ожидания первого символа в ответе
-        let mut w2_cycles = 0; // циклов задержки ожидания последнего символа в ответе
-        loop {
-            let res = self.sim800_port.read();
-            match res {
-                Err(nb::Error::Other(_)) => {
-                    writeln!(ctx.console, "SIM e1").unwrap();
-                    break;
-                }
-                Err(nb::Error::WouldBlock) => {
-                    // символ не пришёл ещё
-                    let t = ctx.at_timer.wait();
-                    match t {
-                        Err(nb::Error::Other(_)) => {
-                            writeln!(ctx.console, "SIM e2").unwrap();
-                            break;
-                        }
-                        Err(nb::Error::WouldBlock) => {
-                            // просто ждём ещё таймер
-                            continue;
-                        }
-                        Ok(_) => {
-                            // сработал таймер отсчёта таймаута
-                            if got_first_char {
-                                // отрабатываем ожидание последнего символа
-                                if w2_cycles >= to {
-                                    break; // вылет по таймауту
-                                } else {
-                                    w2_cycles += 1;
-                                    continue;
-                                }
-                            } else {
-                                // отрабатываем ожидание первого символа
-                                if w1_cycles >= toc {
-                                    break;
-                                } else {
-                                    w1_cycles += 1;
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(x) => {
-                    // получили очередной символ от SIM800
-                    if self.rcv_buf.len() < SIM800_RCV_BUF_LEN {
-                        // защита от переполнения буфера
-                        self.rcv_buf.push(x).unwrap();
-                    } else {
-                        break;
-                    }
-                    got_first_char = true; // после первого символа переходим на ожидание последнего
-                    w2_cycles = 0;
-                    ctx.at_timer.reset(); // timeout timer restart after each byte recieved
-                    continue;
-                }
-            }
-        }
-        if self.rcv_buf.len() == 0 {
-            // ничего не смогли получить
-            writeln!(ctx.console, "SIM nrsp").unwrap();
-            return false;
-        }
-        true
-    }
-
-    // отправка команды за несколько попыток
-    fn send_at_cmd_wait_resp_n(
-        &mut self,
-        ctx: &mut Context,
-        at_cmd: &[u8],
-        ans: &[u8],
-        toc: u16, // timeout for first char
-        to: u16,  // timeout after last char
-        tries: u8,
-    ) -> bool {
-        // no of attempts
-        // checks if reply from SIM800L contains ans using tries attempts
-        let mut reply: bool = false;
-        for _ in 1..=tries {
-            self.send_at_cmd_wait_resp(ctx, at_cmd, toc, to);
-            if self.buf_contains(ans) {
-                reply = true;
-                break;
-            }
-            ctx.delay.delay_ms(500_u16); // delay between attempts
-            ctx.watchdog.feed();
-        }
-        reply
-    }
-
-    // блокировка приёма звонков
-    fn gsm_busy(&mut self, ctx: &mut Context, set_to: bool) -> bool {
-        let command = if set_to {
-            b"AT+GSMBUSY=1\n"
-        } else {
-            b"AT+GSMBUSY=0\n"
-        };
-        let r1 = self.send_at_cmd_wait_resp_n(ctx, command, b"OK\r", 100, 10, 3);
-        if !(r1) {
-            return false;
-        }
-        true
-    }
-
-    // команды инициализации до регистрации в сети
-    fn init_set_0(&mut self, ctx: &mut Context) -> bool {
-        if self.state == ComStates::Initial {
-            return false;
-        }
-        // Reset to the factory settings
-        let r1 = self.send_at_cmd_wait_resp_n(ctx, b"AT&F\n", b"OK\r", 100, 10, 3);
-        // switch off echo
-        let r2 = self.send_at_cmd_wait_resp_n(ctx, b"ATE0\n", b"OK\r", 50, 10, 3);
-        // setup fixed baud rate 9600
-        let r3 = self.send_at_cmd_wait_resp_n(ctx, b"AT+IPR=9600\n", b"OK\r", 100, 10, 3);
-        if !(r1 && r2 && r3) {
-            return false;
-        }
-        true
-    }
-
-    // executed after module registration in network
-    fn init_set_1(&mut self, ctx: &mut Context) -> bool {
-        if self.state == ComStates::Initial {
-            return false;
-        }
-        // block unsolicited RINGs
-        let r0 = self.gsm_busy(ctx, true);
-        // Request calling line identification
-        let r1 = self.send_at_cmd_wait_resp_n(ctx, b"AT+CLIP=1\n", b"OK\r", 50, 10, 3);
-        // Mobile Equipment Error Code
-        let r2 = self.send_at_cmd_wait_resp_n(ctx, b"AT+CMEE=0\n", b"OK\r", 50, 10, 3);
-        // set the SMS mode to text
-        let r3 = self.send_at_cmd_wait_resp_n(ctx, b"AT+CMGF=1\n", b"OK\r", 50, 10, 3);
-        // Disable messages about new SMS from the GSM module
-        let r4 = self.send_at_cmd_wait_resp_n(ctx, b"AT+CNMI=2,0\n", b"OK\r", 100, 10, 3);
-        // send AT command to init memory for SMS in the SIM card
-        // response:
-        // +CPMS: <usedr>,<totalr>,<usedw>,<totalw>,<useds>,<totals>
-        let r5 = self.send_at_cmd_wait_resp_n(
-            ctx,
-            b"AT+CPMS=\"SM\",\"SM\",\"SM\"\n",
-            b"+CPMS:",
-            100,
-            100,
-            3,
-        );
-        // select phonebook memory storage
-        let r6 = self.send_at_cmd_wait_resp_n(ctx, b"AT+CPBS=\"SM\"\n", b"OK\r", 100, 10, 3);
-        // Deactivate GPRS PDP context
-        let r7 = self.send_at_cmd_wait_resp_n(ctx, b"AT+CIPSHUT\n", b"SHUT OK", 100, 10, 3);
-        if !(r0 && r1 && r2 && r3 && r4 && r5 && r6 && r7) {
-            return false;
-        }
-        true
-    }
-
-    // проверка/инициализация связи с модулем
-    fn check_com(&mut self, ctx: &mut Context) -> bool {
-        let mut r = self.send_at_cmd_wait_resp_n(ctx, b"AT\n", b"OK\r", 50, 10, 20);
-        if r {
-            if self.state != ComStates::Registered {
-                if self.state == ComStates::Initial {
-                    r = self.init_set_0(ctx);
-                }
-                self.state = ComStates::Connected;
-            }
-        } else {
-            self.state = ComStates::Initial;
-        }
-        r
-    }
-
-    // перезагрузка модуля при проблемах
-    fn reboot(&mut self, ctx: &mut Context) -> bool {
-        self.sim_reset_pin.set_low().unwrap();
-        ctx.beep();
-        ctx.delay.delay_ms(1_500_u16);
-        self.sim_reset_pin.set_high().unwrap();
-        ctx.watchdog.feed();
-        writeln!(ctx.console, "REBOOT").unwrap();
-        true
-    }
-
-    // проверка регистрации в сети
-    fn check_reg(&mut self, ctx: &mut Context) -> bool {
-        let mut reply: bool = false;
-        let ans1 = b"+CREG: 0,1";
-        let ans2 = b"+CREG: 0,5";
-        for _ in 1..=10 {
-            // 10 attempts
-            let _ = self.send_at_cmd_wait_resp(ctx, b"AT+CREG?\n", 100, 20);
-            if self.buf_contains(ans1) || self.buf_contains(ans2) {
-                if self.state != ComStates::Registered {
-                    reply = self.init_set_1(ctx);
-                    if reply {
-                        reply = self.init_auth(ctx);
-                        //    for nbr in (&self.auth).into_iter() {
-                        //        writeln!(ctx.console, "Num={}", core::str::from_utf8(&nbr).unwrap() );
-                        //    }
-                    }
-                    self.state = ComStates::Registered;
-                } else {
-                    reply = true;
-                }
-                break;
-            } else {
-                self.state = ComStates::Connected;
-            }
-            ctx.watchdog.feed();
-            ctx.delay.delay_ms(5000_u16); // delay between attempts
-            ctx.watchdog.feed();
-        }
-        reply
-    }
-
-    // Считываение первых 3 номеров с SIM карты. Они будут использоваться для авторизации звонков
-    fn init_auth(&mut self, ctx: &mut Context) -> bool {
-        let a = EepromAdresses::Number;
-        self.active_num = ctx.eeprom.read_byte(a.address() as u32).unwrap();
-        if !(self.active_num > 0 && self.active_num < 4) {
-            // неправильный номер в EEPROM
-            self.active_num = 3; // дефолтное значение в 3 ячейке
-            ctx.eeprom
-                .write_byte(a.address() as u32, self.active_num)
-                .unwrap();
-            ctx.delay.delay_ms(10_u16);
-        }
-
-        self.auth.clear();
-        let mut reply: bool = false;
-        for j in 1..=3 {
-            // take first 3 numbers from SIM phonebook
-            let mut buf: Vec<u8, 32> = Vec::new();
-            write!(buf, "AT+CPBR={}\n", j).unwrap();
-            for _ in 1..=3 {
-                // make 3 attempts
-                let _ = self.send_at_cmd_wait_resp(ctx, buf.as_slice(), 100, 10);
-                if self.buf_contains(b"OK\r") {
-                    if !self.buf_contains(b"+CPBR:") {
-                        self.auth
-                            .push(Vec::<u8, SIM800_NUMBER_LEN>::from_slice(b"NA").unwrap())
-                            .unwrap();
-                    } else {
-                        // parse for phone number
-                        let mut found = false;
-                        let mut number: Vec<u8, SIM800_NUMBER_LEN> = Vec::new();
-                        for sub in &self.rcv_buf {
-                            if sub == &b'"' {
-                                if found {
-                                    break;
-                                }
-                                found = true;
-                                continue;
-                            }
-                            if found {
-                                //copy chars from SIM800 reply
-                                number.push(*sub).unwrap();
-                            }
-                        }
-                        self.auth.push(number).unwrap();
-                    }
-                    reply = true;
-                    break;
-                }
-                ctx.delay.delay_ms(500_u16); // delay between attempts
-                ctx.watchdog.feed();
-            }
-        }
-        reply
-    }
-
-    // отправка простого SMS на дефолтный номер
-    fn send_sms(&mut self, ctx: &mut Context, msg: &[u8]) -> bool {
-        let mut reply = false;
-        let mut buf: Vec<u8, 160> = Vec::new();
-        write!(
-            buf,
-            "AT+CMGS=\"{}\"\n",
-            core::str::from_utf8(self.get_active_num()).unwrap()
-        )
-        .unwrap();
-        let _ = self.send_at_cmd_wait_resp(ctx, buf.as_slice(), 100, 10);
-        if self.buf_contains(b">") {
-            buf.clear();
-            write!(buf, "{}\u{001a}", core::str::from_utf8(&msg).unwrap()).unwrap();
-            writeln!(
-                ctx.console,
-                "sms msg = {}",
-                core::str::from_utf8(&buf).unwrap()
-            )
-            .unwrap();
-            let _ = self.send_at_cmd_wait_resp(ctx, buf.as_slice(), 700, 100);
-            if self.buf_contains(b"+CMGS") {
-                reply = true;
-            }
-        } else {
-            reply = false;
-        }
-        ctx.delay.delay_ms(1000_u16); // чуть ждём после посылки
-        reply
-    }
-
-    // Определение входящего авторизованного звонка
-    fn call_detect(&mut self, ctx: &mut Context) -> bool {
-        let mut reply = false;
-        // enable incoming calls and unsolicited RINGs
-        let r0 = self.gsm_busy(ctx, false);
-        if !r0 {
-            return false;
-        }
-
-        // пробуем получить RING
-        self.rcv_buf.clear();
-        ctx.at_timer.reset(); // reset timeout counter
-        let mut got_first_char = false; // признак, что получили что-то из порта
-        let mut w1_cycles = 0; // циклов задержки ожидания первого символа в ответе
-        let mut w2_cycles = 0; // циклов задержки ожидания последнего символа в ответе
-        let mut led_state = false;
-        loop {
-            ctx.watchdog.feed();
-
-            // мигаем периодически светодиодом - heartbeat
-            let cnt3 = SEC_COUNT_LED.load(Ordering::Relaxed);
-            if cnt3 > 1 {
-                if led_state {
-                    ctx.led.set_high().unwrap();
-                    led_state = false;
-                } else {
-                    ctx.led.set_low().unwrap();
-                    led_state = true;
-                }
-                SEC_COUNT_LED.store(0, Ordering::Relaxed); // сбрасываем таймер
-            }
-
-            let res = self.sim800_port.read();
-            match res {
-                Err(nb::Error::Other(_)) => {
-                    writeln!(ctx.console, "RING e1").unwrap();
-                    break;
-                }
-                Err(nb::Error::WouldBlock) => {
-                    // символ не пришёл ещё
-                    let t = ctx.at_timer.wait();
-                    match t {
-                        Err(nb::Error::Other(_)) => {
-                            writeln!(ctx.console, "RING e2").unwrap();
-                            break;
-                        }
-                        Err(nb::Error::WouldBlock) => {
-                            // просто ждём ещё таймер
-                            continue;
-                        }
-                        Ok(_) => {
-                            // сработал таймер отсчёта таймаута
-                            if got_first_char {
-                                // отрабатываем ожидание последнего символа
-                                if w2_cycles >= 200 {
-                                    break; // вылет по таймауту
-                                } else {
-                                    w2_cycles += 1;
-                                    continue;
-                                }
-                            } else {
-                                // отрабатываем ожидание первого символа 10 сек
-                                if w1_cycles >= 1000 {
-                                    break;
-                                } else {
-                                    w1_cycles += 1;
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(x) => {
-                    // получили очередной символ от SIM800
-                    if self.rcv_buf.len() < SIM800_RCV_BUF_LEN {
-                        // защита от переполнения буфера
-                        self.rcv_buf.push(x).unwrap();
-                    } else {
-                        break;
-                    }
-                    got_first_char = true; // после первого символа переходим на ожидание последнего
-                    w2_cycles = 0;
-                    ctx.at_timer.reset(); // timeout timer restart after each byte recieved
-                    continue;
-                }
-            }
-        }
-        if self.rcv_buf.len() == 0 {
-            // ничего не смогли получить
-            writeln!(ctx.console, "NO RING").unwrap();
-            self.gsm_busy(ctx, true); // block GSM RINGs
-            return false;
-        }
-
-        // check RING number in buf
-        let mut number: Vec<u8, SIM800_NUMBER_LEN> = Vec::new();
-        if !self.buf_contains(b"+CLIP:") {
-            number.push(b'N').unwrap();
-        } else {
-            // ищем номер вызывающего телефона
-            let mut found = false;
-            for sub in &self.rcv_buf {
-                if sub == &b'"' {
-                    if found {
-                        break;
-                    }
-                    found = true;
-                    continue;
-                }
-                if found {
-                    //copy chars from SIM800 reply
-                    number.push(*sub).unwrap();
-                }
-            }
-            // звонок с номера
-            writeln!(
-                ctx.console,
-                "RING: {}",
-                core::str::from_utf8(&number).unwrap()
-            )
-            .unwrap();
-        }
-
-        // check number is auth
-        for (i, nbr) in (&self.auth).into_iter().enumerate() {
-            if nbr == &number {
-                //println!("auth num = {}", core::str::from_utf8(&number).unwrap());
-                reply = true;
-                let number_i = i as u8 + 1;
-                if self.active_num != number_i {
-                    self.active_num = number_i;
-                    let a = EepromAdresses::Number;
-                    ctx.save_byte(a.address() as u32, self.active_num);
-                }
-                break;
-            }
-        }
-
-        // hang up call
-        let r6 = self.send_at_cmd_wait_resp_n(ctx, b"ATH\n", b"OK\r", 50, 10, 3);
-        if !r6 {
-            return false;
-        }
-        // block unsolicited RINGs
-        let r1 = self.gsm_busy(ctx, true);
-        if !r1 {
-            return false;
-        }
-        reply
-    }
-}
-
-//--------------------------------------------------------------
 // Функции отслеживания состояний датчиков 220в и температуры
 //--------------------------------------------------------------
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -961,11 +387,6 @@ impl EepromAdresses {
             EepromAdresses::Number => 0x04,
         }
     }
-}
-
-// характеристика указывает, что объект можно взять на контроль
-trait Observable {
-    fn check(&mut self, ctx: &mut Context, sim: &mut Sim800) -> bool;
 }
 
 // структура для отслеживания напряжения 220в питания МК
@@ -1065,7 +486,7 @@ impl V220Control {
 }
 
 impl Observable for V220Control {
-    fn check(&mut self, ctx: &mut Context, sim: &mut Sim800) -> bool {
+    fn check<PINS>(&mut self, ctx: &mut Context, sim: &mut Sim800<PINS>) -> Result<(), ()> {
         match self.state {
             V220States::ColdStart => {
                 self.measure();
@@ -1094,7 +515,7 @@ impl Observable for V220Control {
                 }
             }
         }
-        true
+        Ok(())
     }
 }
 
@@ -1232,7 +653,7 @@ impl TempControl {
 }
 
 impl Observable for TempControl {
-    fn check(&mut self, ctx: &mut Context, sim: &mut Sim800) -> bool {
+    fn check<PINS>(&mut self, ctx: &mut Context, sim: &mut Sim800<PINS>) -> Result<(), ()> {
         match self.state {
             TemperatureStates::ColdStart => {
                 self.measure(ctx);
@@ -1261,7 +682,7 @@ impl Observable for TempControl {
                 }
             }
         }
-        true
+        Ok(())
     }
 }
 

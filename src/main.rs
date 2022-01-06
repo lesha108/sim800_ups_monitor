@@ -3,10 +3,12 @@
 #![warn(clippy::pedantic)]
 
 mod context;
+mod eeprom;
 mod interrupts;
 mod sim;
 mod traits;
 mod ups;
+mod voltage;
 
 use stm32f1xx_hal::prelude::*;
 //
@@ -36,10 +38,12 @@ use stm32f1xx_hal::{
 //use cortex_m_semihosting::hio;  //  For displaying messages on the debug console.
 
 use crate::context::Context;
+use crate::eeprom::EepromAdresses;
 use crate::interrupts::{SEC_COUNT_REBOOT, SEC_COUNT_SENSOR, SEC_TIMER};
 use crate::sim::Sim800;
 use crate::traits::Observable;
 use crate::ups::Ups;
+use crate::voltage::{Battery, V220Control};
 
 /// Определяем входную функцию
 #[entry]
@@ -366,159 +370,6 @@ fn main() -> ! {
     }
 }
 
-//--------------------------------------------------------------
-// Функции отслеживания состояний датчиков 220в и температуры
-//--------------------------------------------------------------
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum EepromAdresses {
-    V220State,
-    // состояние датчика напряжения 220 в
-    TempState,
-    // состояние датчика температуры DS18B20
-    Number, // телефонный номер отправки SMS
-}
-
-// возвращает адрес сохраненного значения в чипе EEPROM
-impl EepromAdresses {
-    fn address(self) -> u8 {
-        match self {
-            EepromAdresses::V220State => 0x01,
-            EepromAdresses::TempState => 0x02,
-            EepromAdresses::Number => 0x04,
-        }
-    }
-}
-
-// структура для отслеживания напряжения 220в питания МК
-
-// константы подбираются экспериментально!!!
-const VCC: f32 = 3.3;
-// напряжение питания МК
-const V220_START: f32 = 1.5;
-// значение ADC, означающее приемлемое напряжение питания
-const V220_LIMIT_LOW: f32 = 0.3; // пороговое значение ADC, означающее отсутствие питания
-
-#[derive(PartialEq)]
-enum V220States {
-    ColdStart,
-    // инициализация измерений
-    Monitoring,
-    // ожидание падения напряжения 220 в
-    WaitForNormal, // ожидание восстановления 220 в
-}
-
-struct V220Control {
-    state: V220States,
-    address: u8,
-    voltage: f32,
-    int_temp: i32,
-    analog_input: stm32f1xx_hal::gpio::gpiob::PB0<stm32f1xx_hal::gpio::Analog>,
-    adc: adc::Adc<pac::ADC1>,
-}
-
-impl V220Control {
-    fn new(
-        pin: stm32f1xx_hal::gpio::gpiob::PB0<stm32f1xx_hal::gpio::Analog>,
-        adc1: adc::Adc<pac::ADC1>,
-    ) -> V220Control {
-        let a = EepromAdresses::V220State;
-        V220Control {
-            state: V220States::ColdStart,
-            address: a.address(),
-            voltage: 0.0,
-            int_temp: 0,
-            analog_input: pin,
-            adc: adc1,
-        }
-    }
-
-    // восстановление состояния из EEPROM после перезагрузки МК
-    fn load(&mut self, ctx: &mut Context) -> bool {
-        if self.state != V220States::ColdStart {
-            return true;
-        }
-        let read_data = ctx.eeprom.read_byte(self.address as u32).unwrap();
-        match read_data {
-            0 => self.state = V220States::ColdStart,
-            1 => self.state = V220States::Monitoring,
-            2 => self.state = V220States::WaitForNormal,
-            _ => self.state = V220States::ColdStart,
-        }
-        true
-    }
-
-    // запись состояния в EEPROM
-    fn save(&mut self, ctx: &mut Context) -> Result<(), ()> {
-        let data = {
-            match self.state {
-                V220States::ColdStart => 0,
-                V220States::Monitoring => 1,
-                V220States::WaitForNormal => 2,
-            }
-        };
-        ctx.save_byte(self.address as u32, data)
-    }
-
-    // измерение напряжения 220 в
-    fn measure(&mut self) -> f32 {
-        let mut averaged: u32 = 0;
-        for _ in 0..8 {
-            let data: u16 = self.adc.read(&mut self.analog_input).unwrap(); //3.3d = 4095, 3.3/2 = 2036
-            averaged += data as u32;
-        }
-        self.voltage = averaged as f32 / 8.0 / 4096.0 * VCC;
-        self.voltage
-    }
-
-    fn get_voltage(&mut self) -> f32 {
-        self.voltage
-    }
-
-    // измерение температуры чипа
-    fn measure_temp(&mut self) -> i32 {
-        self.int_temp = self.adc.read_temp();
-        self.int_temp
-    }
-
-    fn get_temp(&mut self) -> i32 {
-        self.int_temp
-    }
-}
-
-impl Observable for V220Control {
-    fn check<PINS>(&mut self, ctx: &mut Context, sim: &mut Sim800<PINS>) -> Result<(), ()> {
-        match self.state {
-            V220States::ColdStart => {
-                self.measure();
-                self.state = V220States::Monitoring;
-            }
-            V220States::Monitoring => {
-                if self.voltage < V220_LIMIT_LOW {
-                    // сетевое напряжение пропало
-                    sim.send_sms(ctx, b"220 failed");
-                    writeln!(ctx.console, "220 failed {}", self.voltage).unwrap();
-                    ctx.beep();
-
-                    self.state = V220States::WaitForNormal;
-                    self.save(ctx);
-                }
-            }
-            V220States::WaitForNormal => {
-                if self.voltage > V220_START {
-                    // сетевое напряжение вернулось
-                    sim.send_sms(ctx, b"220 on-line");
-                    writeln!(ctx.console, "220 on-line").unwrap();
-                    ctx.beep();
-
-                    self.state = V220States::Monitoring;
-                    self.save(ctx);
-                }
-            }
-        }
-        Ok(())
-    }
-}
-
 // структура для отслеживания диапазона датчика температуры DS18B20
 
 const TEMP_LIMIT_HIGH: f32 = 20.0;
@@ -549,10 +400,9 @@ impl TempControl {
             stm32f1xx_hal::gpio::Pxx<stm32f1xx_hal::gpio::Output<stm32f1xx_hal::gpio::OpenDrain>>,
         >,
     ) -> TempControl {
-        let a = EepromAdresses::TempState;
         TempControl {
             state: TemperatureStates::ColdStart,
-            address: a.address(),
+            address: EepromAdresses::TempState.into(),
             temp: 0.0,
             one_wire_bus: bus,
         }
@@ -683,41 +533,5 @@ impl Observable for TempControl {
             }
         }
         Ok(())
-    }
-}
-
-// структура для отслеживания напряжения батареи питания МК
-
-struct Battery {
-    voltage: f32,
-    analog_input: stm32f1xx_hal::gpio::gpiob::PB1<stm32f1xx_hal::gpio::Analog>,
-    adc: adc::Adc<pac::ADC2>,
-}
-
-impl Battery {
-    fn new(
-        pin: stm32f1xx_hal::gpio::gpiob::PB1<stm32f1xx_hal::gpio::Analog>,
-        adc2: adc::Adc<pac::ADC2>,
-    ) -> Battery {
-        Battery {
-            voltage: 0.0,
-            analog_input: pin,
-            adc: adc2,
-        }
-    }
-
-    fn get_voltage(&mut self) -> f32 {
-        self.voltage
-    }
-
-    // измерение напряжения батареи
-    fn measure(&mut self) -> f32 {
-        let mut averaged: u32 = 0;
-        for _ in 0..8 {
-            let data: u16 = self.adc.read(&mut self.analog_input).unwrap(); //3.3d = 4095, 3.3/2 = 2036
-            averaged += data as u32;
-        }
-        self.voltage = averaged as f32 / 8.0 / 4096.0 * VCC;
-        self.voltage
     }
 }

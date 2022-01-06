@@ -10,8 +10,8 @@ use stm32f1xx_hal::pac;
 use stm32f1xx_hal::serial::Serial;
 
 use crate::context::Context;
+use crate::eeprom::EepromAdresses;
 use crate::interrupts::SEC_COUNT_LED;
-use crate::EepromAdresses; //todo
 
 /// длина буфера телефонного номера SIM800
 const SIM800_NUMBER_LEN: usize = 40;
@@ -54,6 +54,245 @@ impl<PINS> Sim800<PINS> {
             sim800_port: port,
             sim_reset_pin: pin,
         }
+    }
+
+    /// перезагрузка модуля при проблемах
+    pub fn reboot(&mut self, ctx: &mut Context) {
+        self.sim_reset_pin.set_low().unwrap();
+        ctx.beep();
+        ctx.delay.delay_ms(1_500_u16);
+        self.sim_reset_pin.set_high().unwrap();
+        ctx.watchdog.feed();
+        writeln!(ctx.console, "REBOOT").unwrap();
+    }
+
+    /// проверка/инициализация связи с модулем
+    pub fn check_com(&mut self, ctx: &mut Context) -> Result<(), ()> {
+        let mut r = self.send_at_cmd_wait_resp_n(ctx, b"AT\n", b"OK\r", 50, 10, 20);
+        if r.is_ok() {
+            if self.state != ComStates::Registered {
+                if self.state == ComStates::Initial {
+                    r = self.init_set_0(ctx);
+                }
+                self.state = ComStates::Connected;
+            }
+        } else {
+            self.state = ComStates::Initial;
+        }
+        r
+    }
+
+    /// проверка регистрации в сети
+    pub fn check_reg(&mut self, ctx: &mut Context) -> Result<(), ()> {
+        let mut reply = Ok(());
+        let ans1 = b"+CREG: 0,1";
+        let ans2 = b"+CREG: 0,5";
+        // 10 attempts
+        for _ in 1..=10 {
+            let _ = self.send_at_cmd_wait_resp(ctx, b"AT+CREG?\n", 100, 20);
+            if self.buf_contains(ans1).is_ok() || self.buf_contains(ans2).is_ok() {
+                if self.state != ComStates::Registered {
+                    reply = self.init_set_1(ctx);
+                    if reply.is_ok() {
+                        reply = self.init_auth(ctx);
+                        //    for nbr in (&self.auth).into_iter() {
+                        //        writeln!(ctx.console, "Num={}", core::str::from_utf8(&nbr).unwrap() );
+                        //    }
+                    }
+                    self.state = ComStates::Registered;
+                } else {
+                    reply = Ok(());
+                }
+                break;
+            } else {
+                self.state = ComStates::Connected;
+            }
+            ctx.watchdog.feed();
+            ctx.delay.delay_ms(5000_u16); // delay between attempts
+            ctx.watchdog.feed();
+        }
+        reply
+    }
+
+    /// отправка простого SMS на дефолтный номер
+    pub fn send_sms(&mut self, ctx: &mut Context, msg: &[u8]) -> Result<(), ()> {
+        let mut reply = Err(());
+        let mut buf: Vec<u8, 160> = Vec::new();
+        write!(
+            buf,
+            "AT+CMGS=\"{}\"\n",
+            core::str::from_utf8(self.get_active_num()).unwrap()
+        )
+        .unwrap();
+        let _ = self.send_at_cmd_wait_resp(ctx, buf.as_slice(), 100, 10);
+        if self.buf_contains(b">").is_ok() {
+            buf.clear();
+            write!(buf, "{}\u{001a}", core::str::from_utf8(&msg).unwrap()).unwrap();
+            writeln!(
+                ctx.console,
+                "sms msg = {}",
+                core::str::from_utf8(&buf).unwrap()
+            )
+            .unwrap();
+            let _ = self.send_at_cmd_wait_resp(ctx, buf.as_slice(), 700, 100);
+            if self.buf_contains(b"+CMGS").is_ok() {
+                reply = Ok(());
+            }
+        } else {
+            reply = Err(());
+        }
+        ctx.delay.delay_ms(1000_u16); // чуть ждём после посылки
+        reply
+    }
+
+    /// Определение входящего авторизованного звонка
+    pub fn call_detect(&mut self, ctx: &mut Context) -> Result<(), ()> {
+        // enable incoming calls and unsolicited RINGs
+        if self.gsm_busy(ctx, false).is_err() {
+            return Err(());
+        }
+        let mut reply = Err(());
+
+        // пробуем получить RING
+        self.rcv_buf.clear();
+        ctx.at_timer.reset(); // reset timeout counter
+        let mut got_first_char = false; // признак, что получили что-то из порта
+        let mut w1_cycles = 0; // циклов задержки ожидания первого символа в ответе
+        let mut w2_cycles = 0; // циклов задержки ожидания последнего символа в ответе
+        let mut led_state = false;
+        loop {
+            ctx.watchdog.feed();
+
+            // мигаем периодически светодиодом - heartbeat
+            let cnt3 = SEC_COUNT_LED.load(Ordering::Relaxed);
+            if cnt3 > 1 {
+                if led_state {
+                    ctx.led.set_high().unwrap();
+                    led_state = false;
+                } else {
+                    ctx.led.set_low().unwrap();
+                    led_state = true;
+                }
+                SEC_COUNT_LED.store(0, Ordering::Relaxed); // сбрасываем таймер
+            }
+
+            let res = self.sim800_port.read();
+            match res {
+                Err(nb::Error::Other(_)) => {
+                    writeln!(ctx.console, "RING e1").unwrap();
+                    break;
+                }
+                Err(nb::Error::WouldBlock) => {
+                    // символ не пришёл ещё
+                    let t = ctx.at_timer.wait();
+                    match t {
+                        Err(nb::Error::Other(_)) => {
+                            writeln!(ctx.console, "RING e2").unwrap();
+                            break;
+                        }
+                        Err(nb::Error::WouldBlock) => {
+                            // просто ждём ещё таймер
+                            continue;
+                        }
+                        Ok(_) => {
+                            // сработал таймер отсчёта таймаута
+                            if got_first_char {
+                                // отрабатываем ожидание последнего символа
+                                if w2_cycles >= 200 {
+                                    break; // вылет по таймауту
+                                } else {
+                                    w2_cycles += 1;
+                                    continue;
+                                }
+                            } else {
+                                // отрабатываем ожидание первого символа 10 сек
+                                if w1_cycles >= 1000 {
+                                    break;
+                                } else {
+                                    w1_cycles += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(x) => {
+                    // получили очередной символ от SIM800
+                    if self.rcv_buf.len() < SIM800_RCV_BUF_LEN {
+                        // защита от переполнения буфера
+                        self.rcv_buf.push(x).unwrap();
+                    } else {
+                        break;
+                    }
+                    got_first_char = true; // после первого символа переходим на ожидание последнего
+                    w2_cycles = 0;
+                    ctx.at_timer.reset(); // timeout timer restart after each byte recieved
+                    continue;
+                }
+            }
+        }
+        if self.rcv_buf.len() == 0 {
+            // ничего не смогли получить
+            writeln!(ctx.console, "NO RING").unwrap();
+            self.gsm_busy(ctx, true); // block GSM RINGs
+            return Err(());
+        }
+
+        // check RING number in buf
+        let mut number: Vec<u8, SIM800_NUMBER_LEN> = Vec::new();
+        if self.buf_contains(b"+CLIP:").is_err() {
+            number.push(b'N').unwrap();
+        } else {
+            // ищем номер вызывающего телефона
+            let mut found = false;
+            for sub in &self.rcv_buf {
+                if sub == &b'"' {
+                    if found {
+                        break;
+                    }
+                    found = true;
+                    continue;
+                }
+                if found {
+                    //copy chars from SIM800 reply
+                    number.push(*sub).unwrap();
+                }
+            }
+            // звонок с номера
+            writeln!(
+                ctx.console,
+                "RING: {}",
+                core::str::from_utf8(&number).unwrap()
+            )
+            .unwrap();
+        }
+
+        // check number is auth
+        for (i, nbr) in (&self.auth).into_iter().enumerate() {
+            if nbr == &number {
+                //println!("auth num = {}", core::str::from_utf8(&number).unwrap());
+                reply = Ok(());
+                let number_i = i as u8 + 1;
+                if self.active_num != number_i {
+                    self.active_num = number_i;
+                    ctx.save_byte(EepromAdresses::Number.into(), self.active_num);
+                }
+                break;
+            }
+        }
+
+        // hang up call
+        if self
+            .send_at_cmd_wait_resp_n(ctx, b"ATH\n", b"OK\r", 50, 10, 3)
+            .is_err()
+        {
+            return Err(());
+        }
+        // block unsolicited RINGs
+        if self.gsm_busy(ctx, true).is_err() {
+            return Err(());
+        }
+        reply
     }
 
     /// номер, на который будут отправляться СМС
@@ -277,73 +516,14 @@ impl<PINS> Sim800<PINS> {
         }
     }
 
-    /// проверка/инициализация связи с модулем
-    pub fn check_com(&mut self, ctx: &mut Context) -> Result<(), ()> {
-        let mut r = self.send_at_cmd_wait_resp_n(ctx, b"AT\n", b"OK\r", 50, 10, 20);
-        if r.is_ok() {
-            if self.state != ComStates::Registered {
-                if self.state == ComStates::Initial {
-                    r = self.init_set_0(ctx);
-                }
-                self.state = ComStates::Connected;
-            }
-        } else {
-            self.state = ComStates::Initial;
-        }
-        r
-    }
-
-    /// перезагрузка модуля при проблемах
-    pub fn reboot(&mut self, ctx: &mut Context) {
-        self.sim_reset_pin.set_low().unwrap();
-        ctx.beep();
-        ctx.delay.delay_ms(1_500_u16);
-        self.sim_reset_pin.set_high().unwrap();
-        ctx.watchdog.feed();
-        writeln!(ctx.console, "REBOOT").unwrap();
-    }
-
-    /// проверка регистрации в сети
-    pub fn check_reg(&mut self, ctx: &mut Context) -> Result<(), ()> {
-        let mut reply = Ok(());
-        let ans1 = b"+CREG: 0,1";
-        let ans2 = b"+CREG: 0,5";
-        // 10 attempts
-        for _ in 1..=10 {
-            let _ = self.send_at_cmd_wait_resp(ctx, b"AT+CREG?\n", 100, 20);
-            if self.buf_contains(ans1).is_ok() || self.buf_contains(ans2).is_ok() {
-                if self.state != ComStates::Registered {
-                    reply = self.init_set_1(ctx);
-                    if reply.is_ok() {
-                        reply = self.init_auth(ctx);
-                        //    for nbr in (&self.auth).into_iter() {
-                        //        writeln!(ctx.console, "Num={}", core::str::from_utf8(&nbr).unwrap() );
-                        //    }
-                    }
-                    self.state = ComStates::Registered;
-                } else {
-                    reply = Ok(());
-                }
-                break;
-            } else {
-                self.state = ComStates::Connected;
-            }
-            ctx.watchdog.feed();
-            ctx.delay.delay_ms(5000_u16); // delay between attempts
-            ctx.watchdog.feed();
-        }
-        reply
-    }
-
     /// Считываение первых 3 номеров с SIM карты. Они будут использоваться для авторизации звонков
     fn init_auth(&mut self, ctx: &mut Context) -> Result<(), ()> {
-        let a = EepromAdresses::Number;
-        self.active_num = ctx.eeprom.read_byte(a.address() as u32).unwrap();
+        self.active_num = ctx.eeprom.read_byte(EepromAdresses::Number.into()).unwrap();
         if !(self.active_num > 0 && self.active_num < 4) {
             // неправильный номер в EEPROM
             self.active_num = 3; // дефолтное значение в 3 ячейке
             ctx.eeprom
-                .write_byte(a.address() as u32, self.active_num)
+                .write_byte(EepromAdresses::Number.into(), self.active_num)
                 .unwrap();
             ctx.delay.delay_ms(10_u16);
         }
@@ -387,187 +567,5 @@ impl<PINS> Sim800<PINS> {
             }
         }
         Err(())
-    }
-
-    /// отправка простого SMS на дефолтный номер
-    pub(crate) fn send_sms(&mut self, ctx: &mut Context, msg: &[u8]) -> Result<(), ()> {
-        let mut reply = Err(());
-        let mut buf: Vec<u8, 160> = Vec::new();
-        write!(
-            buf,
-            "AT+CMGS=\"{}\"\n",
-            core::str::from_utf8(self.get_active_num()).unwrap()
-        )
-        .unwrap();
-        let _ = self.send_at_cmd_wait_resp(ctx, buf.as_slice(), 100, 10);
-        if self.buf_contains(b">").is_ok() {
-            buf.clear();
-            write!(buf, "{}\u{001a}", core::str::from_utf8(&msg).unwrap()).unwrap();
-            writeln!(
-                ctx.console,
-                "sms msg = {}",
-                core::str::from_utf8(&buf).unwrap()
-            )
-            .unwrap();
-            let _ = self.send_at_cmd_wait_resp(ctx, buf.as_slice(), 700, 100);
-            if self.buf_contains(b"+CMGS").is_ok() {
-                reply = Ok(());
-            }
-        } else {
-            reply = Err(());
-        }
-        ctx.delay.delay_ms(1000_u16); // чуть ждём после посылки
-        reply
-    }
-
-    /// Определение входящего авторизованного звонка
-    pub fn call_detect(&mut self, ctx: &mut Context) -> Result<(), ()> {
-        // enable incoming calls and unsolicited RINGs
-        if self.gsm_busy(ctx, false).is_err() {
-            return Err(());
-        }
-        let mut reply = Err(());
-
-        // пробуем получить RING
-        self.rcv_buf.clear();
-        ctx.at_timer.reset(); // reset timeout counter
-        let mut got_first_char = false; // признак, что получили что-то из порта
-        let mut w1_cycles = 0; // циклов задержки ожидания первого символа в ответе
-        let mut w2_cycles = 0; // циклов задержки ожидания последнего символа в ответе
-        let mut led_state = false;
-        loop {
-            ctx.watchdog.feed();
-
-            // мигаем периодически светодиодом - heartbeat
-            let cnt3 = SEC_COUNT_LED.load(Ordering::Relaxed);
-            if cnt3 > 1 {
-                if led_state {
-                    ctx.led.set_high().unwrap();
-                    led_state = false;
-                } else {
-                    ctx.led.set_low().unwrap();
-                    led_state = true;
-                }
-                SEC_COUNT_LED.store(0, Ordering::Relaxed); // сбрасываем таймер
-            }
-
-            let res = self.sim800_port.read();
-            match res {
-                Err(nb::Error::Other(_)) => {
-                    writeln!(ctx.console, "RING e1").unwrap();
-                    break;
-                }
-                Err(nb::Error::WouldBlock) => {
-                    // символ не пришёл ещё
-                    let t = ctx.at_timer.wait();
-                    match t {
-                        Err(nb::Error::Other(_)) => {
-                            writeln!(ctx.console, "RING e2").unwrap();
-                            break;
-                        }
-                        Err(nb::Error::WouldBlock) => {
-                            // просто ждём ещё таймер
-                            continue;
-                        }
-                        Ok(_) => {
-                            // сработал таймер отсчёта таймаута
-                            if got_first_char {
-                                // отрабатываем ожидание последнего символа
-                                if w2_cycles >= 200 {
-                                    break; // вылет по таймауту
-                                } else {
-                                    w2_cycles += 1;
-                                    continue;
-                                }
-                            } else {
-                                // отрабатываем ожидание первого символа 10 сек
-                                if w1_cycles >= 1000 {
-                                    break;
-                                } else {
-                                    w1_cycles += 1;
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                }
-                Ok(x) => {
-                    // получили очередной символ от SIM800
-                    if self.rcv_buf.len() < SIM800_RCV_BUF_LEN {
-                        // защита от переполнения буфера
-                        self.rcv_buf.push(x).unwrap();
-                    } else {
-                        break;
-                    }
-                    got_first_char = true; // после первого символа переходим на ожидание последнего
-                    w2_cycles = 0;
-                    ctx.at_timer.reset(); // timeout timer restart after each byte recieved
-                    continue;
-                }
-            }
-        }
-        if self.rcv_buf.len() == 0 {
-            // ничего не смогли получить
-            writeln!(ctx.console, "NO RING").unwrap();
-            self.gsm_busy(ctx, true); // block GSM RINGs
-            return Err(());
-        }
-
-        // check RING number in buf
-        let mut number: Vec<u8, SIM800_NUMBER_LEN> = Vec::new();
-        if self.buf_contains(b"+CLIP:").is_err() {
-            number.push(b'N').unwrap();
-        } else {
-            // ищем номер вызывающего телефона
-            let mut found = false;
-            for sub in &self.rcv_buf {
-                if sub == &b'"' {
-                    if found {
-                        break;
-                    }
-                    found = true;
-                    continue;
-                }
-                if found {
-                    //copy chars from SIM800 reply
-                    number.push(*sub).unwrap();
-                }
-            }
-            // звонок с номера
-            writeln!(
-                ctx.console,
-                "RING: {}",
-                core::str::from_utf8(&number).unwrap()
-            )
-            .unwrap();
-        }
-
-        // check number is auth
-        for (i, nbr) in (&self.auth).into_iter().enumerate() {
-            if nbr == &number {
-                //println!("auth num = {}", core::str::from_utf8(&number).unwrap());
-                reply = Ok(());
-                let number_i = i as u8 + 1;
-                if self.active_num != number_i {
-                    self.active_num = number_i;
-                    let a = EepromAdresses::Number;
-                    ctx.save_byte(a.address() as u32, self.active_num);
-                }
-                break;
-            }
-        }
-
-        // hang up call
-        if self
-            .send_at_cmd_wait_resp_n(ctx, b"ATH\n", b"OK\r", 50, 10, 3)
-            .is_err()
-        {
-            return Err(());
-        }
-        // block unsolicited RINGs
-        if self.gsm_busy(ctx, true).is_err() {
-            return Err(());
-        }
-        reply
     }
 }

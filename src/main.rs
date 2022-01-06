@@ -6,6 +6,7 @@ mod context;
 mod eeprom;
 mod interrupts;
 mod sim;
+mod temp;
 mod traits;
 mod ups;
 mod voltage;
@@ -15,7 +16,6 @@ use stm32f1xx_hal::prelude::*;
 use core::fmt::Write;
 use core::sync::atomic::Ordering;
 use cortex_m_rt::entry;
-use ds18b20::*;
 use eeprom24x::{Eeprom24x, SlaveAddr};
 use embedded_hal::blocking::delay::DelayMs;
 use heapless::*;
@@ -38,9 +38,10 @@ use stm32f1xx_hal::{
 //use cortex_m_semihosting::hio;  //  For displaying messages on the debug console.
 
 use crate::context::Context;
-use crate::eeprom::EepromAdresses;
+use crate::eeprom::Eeprom;
 use crate::interrupts::{SEC_COUNT_REBOOT, SEC_COUNT_SENSOR, SEC_TIMER};
 use crate::sim::Sim800;
+use crate::temp::TempControl;
 use crate::traits::Observable;
 use crate::ups::Ups;
 use crate::voltage::{Battery, V220Control};
@@ -227,7 +228,7 @@ fn main() -> ! {
 
     // объект для взаимодействия с UPS
     let mut ups = Ups::new(serial1);
-    ups.measure(&mut ctx); // первый вызов корректно инициализирует буфер
+    let _ = ups.measure(&mut ctx); // первый вызов корректно инициализирует буфер
     ctx.watchdog.feed();
 
     // объект контроля 220в
@@ -303,11 +304,15 @@ fn main() -> ! {
         // проверяем значения датчиков раз в 30 сек
         let cnt2 = SEC_COUNT_SENSOR.load(Ordering::Relaxed);
         if cnt2 > 30 {
-            v220control.measure(); // получить данные о наличии 220в
-            v220control.measure_temp(); // получить данные о температуре чипа
-            temp_control.measure(&mut ctx); // тепература DS18B20
-            ups.measure(&mut ctx); // получить строку состояния UPS
-                                   // получить данные о напряжении батареи МК при напряжении питания 3.3в
+            // получить данные о наличии 220в
+            v220control.measure();
+            // получить данные о температуре чипа
+            v220control.measure_temp();
+            // температура DS18B20
+            temp_control.measure(&mut ctx);
+            // получить строку состояния UPS
+            let _ = ups.measure(&mut ctx);
+            // получить данные о напряжении батареи МК при напряжении питания 3.3в
             battery.measure();
 
             SEC_COUNT_SENSOR.store(0, Ordering::Relaxed); // сбрасываем таймер
@@ -316,8 +321,8 @@ fn main() -> ! {
         }
 
         // проверка диапазонов значений температуры и напряжения
-        v220control.check(&mut ctx, &mut sim800);
-        temp_control.check(&mut ctx, &mut sim800);
+        let _ = v220control.check(&mut ctx, &mut sim800);
+        let _ = temp_control.check(&mut ctx, &mut sim800);
 
         // проверка необходимости отправки ежедневного статус СМС
         let mut need_sms = false;
@@ -359,179 +364,14 @@ fn main() -> ! {
                 core::str::from_utf8(&ups_ans).unwrap()
             )
             .unwrap();
-            sim800.send_sms(&mut ctx, sms_message.as_slice());
+
             writeln!(
                 ctx.console,
                 "SMS={}",
                 core::str::from_utf8(&sms_message).unwrap()
             )
             .unwrap();
+            let _ = sim800.send_sms(&mut ctx, sms_message.as_slice());
         }
-    }
-}
-
-// структура для отслеживания диапазона датчика температуры DS18B20
-
-const TEMP_LIMIT_HIGH: f32 = 20.0;
-// приемлемое значение температуры
-const TEMP_LIMIT_LOW: f32 = 15.0; // пороговое значение, означающее критическое понижение температуры
-
-#[derive(PartialEq)]
-enum TemperatureStates {
-    ColdStart,
-    // инициализация измерений
-    Monitoring,
-    // ожидание выхода температуры за границы контроля
-    WaitForNormal, // ожидание восстановления нормальной температуры
-}
-
-struct TempControl {
-    state: TemperatureStates,
-    address: u8,
-    temp: f32,
-    one_wire_bus: one_wire_bus::OneWire<
-        stm32f1xx_hal::gpio::Pxx<stm32f1xx_hal::gpio::Output<stm32f1xx_hal::gpio::OpenDrain>>,
-    >,
-}
-
-impl TempControl {
-    fn new(
-        bus: one_wire_bus::OneWire<
-            stm32f1xx_hal::gpio::Pxx<stm32f1xx_hal::gpio::Output<stm32f1xx_hal::gpio::OpenDrain>>,
-        >,
-    ) -> TempControl {
-        TempControl {
-            state: TemperatureStates::ColdStart,
-            address: EepromAdresses::TempState.into(),
-            temp: 0.0,
-            one_wire_bus: bus,
-        }
-    }
-
-    // восстановление состояния из EEPROM после перезагрузки МК
-    fn load(&mut self, ctx: &mut Context) -> bool {
-        if self.state != TemperatureStates::ColdStart {
-            return true;
-        }
-        let read_data = ctx.eeprom.read_byte(self.address as u32).unwrap();
-        match read_data {
-            0 => self.state = TemperatureStates::ColdStart,
-            1 => self.state = TemperatureStates::Monitoring,
-            2 => self.state = TemperatureStates::WaitForNormal,
-            _ => self.state = TemperatureStates::ColdStart,
-        }
-        true
-    }
-
-    // запись состояния в EEPROM
-    fn save(&mut self, ctx: &mut Context) -> Result<(), ()> {
-        let data = {
-            match self.state {
-                TemperatureStates::ColdStart => 0,
-                TemperatureStates::Monitoring => 1,
-                TemperatureStates::WaitForNormal => 2,
-            }
-        };
-        ctx.save_byte(self.address as u32, data)
-    }
-
-    // измерение температуры
-    fn measure(&mut self, ctx: &mut Context) -> f32 {
-        let w1 =
-            ds18b20::start_simultaneous_temp_measurement(&mut self.one_wire_bus, &mut ctx.delay);
-        match w1 {
-            Err(_) => {
-                writeln!(ctx.console, "OW e1").unwrap();
-                return -101.0;
-            }
-            Ok(_) => {
-                Resolution::Bits12.delay_for_measurement_time(&mut ctx.delay);
-                let mut search_state = None;
-                let w2 =
-                    self.one_wire_bus
-                        .device_search(search_state.as_ref(), false, &mut ctx.delay);
-                match w2 {
-                    Err(_) => {
-                        writeln!(ctx.console, "OW e2").unwrap();
-                        return -102.0;
-                    }
-                    Ok(None) => {
-                        writeln!(ctx.console, "OW none").unwrap();
-                        return -103.0;
-                    }
-                    Ok(Some((device_address, state))) => {
-                        search_state = Some(state); // у нас только один датчик, дальше не ищем
-                        if device_address.family_code() == ds18b20::FAMILY_CODE {
-                            let w0: core::result::Result<
-                                ds18b20::Ds18b20,
-                                one_wire_bus::OneWireError<core::convert::Infallible>,
-                            > = Ds18b20::new(device_address);
-                            match w0 {
-                                Err(_) => {
-                                    writeln!(ctx.console, "OW e5").unwrap();
-                                    return -104.0;
-                                }
-                                Ok(sensor) => {
-                                    let w3 =
-                                        sensor.read_data(&mut self.one_wire_bus, &mut ctx.delay);
-                                    match w3 {
-                                        Err(_) => {
-                                            writeln!(ctx.console, "OW e4").unwrap();
-                                            return -105.0;
-                                        }
-                                        Ok(sensor_data) => {
-                                            //writeln!(console, "Device at {:?} is {}C", device_address, sensor_data.temperature);
-                                            self.temp = sensor_data.temperature;
-                                            return self.temp;
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            writeln!(ctx.console, "OW e3").unwrap();
-                            return -106.0;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn get_temp(&mut self) -> f32 {
-        self.temp
-    }
-}
-
-impl Observable for TempControl {
-    fn check<PINS>(&mut self, ctx: &mut Context, sim: &mut Sim800<PINS>) -> Result<(), ()> {
-        match self.state {
-            TemperatureStates::ColdStart => {
-                self.measure(ctx);
-                self.state = TemperatureStates::Monitoring;
-            }
-            TemperatureStates::Monitoring => {
-                if self.temp > -99.0 && self.temp < TEMP_LIMIT_LOW {
-                    // температура упала
-                    sim.send_sms(ctx, b"Temp too low");
-                    writeln!(ctx.console, "Temp too low {}", self.temp).unwrap();
-                    ctx.beep();
-
-                    self.state = TemperatureStates::WaitForNormal;
-                    self.save(ctx);
-                }
-            }
-            TemperatureStates::WaitForNormal => {
-                if self.temp > TEMP_LIMIT_HIGH {
-                    // температура вернулось в норму
-                    sim.send_sms(ctx, b"Temp OK");
-                    writeln!(ctx.console, "Temp OK").unwrap();
-                    ctx.beep();
-
-                    self.state = TemperatureStates::Monitoring;
-                    self.save(ctx);
-                }
-            }
-        }
-        Ok(())
     }
 }

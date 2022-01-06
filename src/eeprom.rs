@@ -1,3 +1,10 @@
+use crate::context::Context;
+
+pub trait Eeprom {
+    fn load(&mut self, ctx: &mut Context);
+    fn save(&mut self, ctx: &mut Context) -> Result<(), ()>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum EepromAdresses {
     /// состояние датчика напряжения 220 в
@@ -23,5 +30,33 @@ impl Into<u32> for EepromAdresses {
     fn into(self) -> u32 {
         let r: u8 = Self::into(self);
         r as u32
+    }
+}
+
+#[derive(PartialEq, Copy, Clone)]
+pub enum State {
+    ColdStart,
+    Monitoring,
+    WaitForNormal,
+}
+
+impl From<u8> for State {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => State::ColdStart,
+            1 => State::Monitoring,
+            2 => State::WaitForNormal,
+            _ => State::ColdStart,
+        }
+    }
+}
+
+impl Into<u8> for State {
+    fn into(self) -> u8 {
+        match self {
+            State::ColdStart => 0,
+            State::Monitoring => 1,
+            State::WaitForNormal => 2,
+        }
     }
 }

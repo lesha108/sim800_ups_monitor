@@ -234,7 +234,7 @@ impl<PINS> Sim800<PINS> {
         if self.rcv_buf.len() == 0 {
             // ничего не смогли получить
             writeln!(ctx.console, "NO RING").unwrap();
-            self.gsm_busy(ctx, true); // block GSM RINGs
+            let _ = self.gsm_busy(ctx, true); // block GSM RINGs
             return Err(());
         }
 
@@ -275,7 +275,7 @@ impl<PINS> Sim800<PINS> {
                 let number_i = i as u8 + 1;
                 if self.active_num != number_i {
                     self.active_num = number_i;
-                    ctx.save_byte(EepromAdresses::Number.into(), self.active_num);
+                    let _ = ctx.save_byte(EepromAdresses::Number.into(), self.active_num);
                 }
                 break;
             }
@@ -427,7 +427,7 @@ impl<PINS> Sim800<PINS> {
         // no of attempts
         // checks if reply from SIM800L contains ans using tries attempts
         for _ in 1..=tries {
-            self.send_at_cmd_wait_resp(ctx, at_cmd, toc, to);
+            let _ = self.send_at_cmd_wait_resp(ctx, at_cmd, toc, to);
             if self.buf_contains(ans).is_ok() {
                 return Ok(());
             }

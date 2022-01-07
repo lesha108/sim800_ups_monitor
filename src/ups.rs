@@ -50,7 +50,7 @@ impl<PINS> Ups<PINS> {
         self.rcv_buf.clear();
         ctx.at_timer.reset(); // reset timeout counter
         let mut got_first_char = false; // признак, что получили что-то из порта
-        let mut w1_cycles = 0; // циклов задержки ожидания первого символа в ответе
+        let w1_cycles = 0; // циклов задержки ожидания первого символа в ответе
         let mut w2_cycles = 0; // циклов задержки ожидания последнего символа в ответе
         loop {
             let res = self.ups_port.read();

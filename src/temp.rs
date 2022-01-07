@@ -1,6 +1,5 @@
 use core::fmt::Write;
 use ds18b20::{Ds18b20, Resolution};
-use one_wire_bus::OneWireResult;
 
 use crate::context::Context;
 use crate::eeprom::{Eeprom, EepromAdresses, State};
@@ -30,7 +29,7 @@ impl TempControl {
     ) -> Self {
         TempControl {
             state: State::ColdStart,
-            address: EepromAdresses::TempState.into(),
+            address: EepromAdresses::TempState as u8,
             temp: 0.0,
             one_wire_bus: bus,
         }
@@ -105,7 +104,7 @@ impl Eeprom for TempControl {
     /// запись состояния в EEPROM
     fn save(&mut self, ctx: &mut Context) -> Result<(), ()> {
         let address = u32::from(self.address);
-        let data = self.state.into();
+        let data = self.state as u8;
         ctx.save_byte(address, data)
     }
 }

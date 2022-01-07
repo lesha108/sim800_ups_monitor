@@ -275,7 +275,8 @@ impl<PINS> Sim800<PINS> {
                 let number_i = i as u8 + 1;
                 if self.active_num != number_i {
                     self.active_num = number_i;
-                    let _ = ctx.save_byte(EepromAdresses::Number.into(), self.active_num);
+                    let address = EepromAdresses::Number as u32;
+                    let _ = ctx.save_byte(address, self.active_num);
                 }
                 break;
             }
@@ -518,13 +519,12 @@ impl<PINS> Sim800<PINS> {
 
     /// Считываение первых 3 номеров с SIM карты. Они будут использоваться для авторизации звонков
     fn init_auth(&mut self, ctx: &mut Context) -> Result<(), ()> {
-        self.active_num = ctx.eeprom.read_byte(EepromAdresses::Number.into()).unwrap();
+        let address = EepromAdresses::Number as u32;
+        self.active_num = ctx.eeprom.read_byte(address).unwrap();
         if !(self.active_num > 0 && self.active_num < 4) {
             // неправильный номер в EEPROM
             self.active_num = 3; // дефолтное значение в 3 ячейке
-            ctx.eeprom
-                .write_byte(EepromAdresses::Number.into(), self.active_num)
-                .unwrap();
+            ctx.eeprom.write_byte(address, self.active_num).unwrap();
             ctx.delay.delay_ms(10_u16);
         }
 

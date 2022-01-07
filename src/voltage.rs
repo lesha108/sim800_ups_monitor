@@ -32,7 +32,7 @@ impl V220Control {
     ) -> Self {
         V220Control {
             state: State::ColdStart,
-            address: EepromAdresses::V220State.into(),
+            address: EepromAdresses::V220State as u8,
             voltage: 0.0,
             int_temp: 0,
             analog_input: pin,
@@ -81,7 +81,7 @@ impl Eeprom for V220Control {
     /// запись состояния в EEPROM
     fn save(&mut self, ctx: &mut Context) -> Result<(), ()> {
         let address = u32::from(self.address);
-        let data = self.state.into();
+        let data = self.state as u8;
         ctx.save_byte(address, data)
     }
 }

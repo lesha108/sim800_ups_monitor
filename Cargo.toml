@@ -1,6 +1,6 @@
 [package]
 name = "sim800_ups_monitor"
-version = "0.2.0"
+version = "0.2.5"
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -19,6 +19,8 @@ ds18b20 = "0.1.1"
 one-wire-bus = "0.1.1"
 usb-device = "0.2.8"
 usbd-serial = "0.1.1"
+shared-bus = "0.2.2"
+hd44780-driver = "0.4.0"
 
 # Пакет для разработки под отладочные платы stm32f1
 [dependencies.stm32f1xx-hal]

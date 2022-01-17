@@ -780,4 +780,87 @@ impl<PINS> Sim800<PINS> {
         }
         Err(Error::NoInSMS)
     }
+
+    // executed after module registration in network
+    pub fn sync_clk(&mut self, ctx: &mut Context) -> Result<(), Error> {
+        // Check whether the GPRS registration is successful
+        self.send_at_cmd_wait_resp_n(ctx, b"AT+CGREG?\n", b"+CGREG: 0,1", 50, 10, 3)?;
+        // write_log(b"AT+CGREG is OK");
+        ctx.watchdog.feed();
+        // Query GPRS attachment status
+        self.send_at_cmd_wait_resp_n(ctx, b"AT+CGATT?\n", b"+CGATT: 1", 50, 10, 3)?;
+        // write_log(b"AT+CGATT is OK");
+        ctx.watchdog.feed();
+        // Set NTP network parameters
+        self.send_at_cmd_wait_resp_n(
+            ctx,
+            b"AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\"\n",
+            b"OK\r",
+            50,
+            10,
+            3,
+        )?;
+        // write_log(b"CONTYPE is OK");
+        ctx.watchdog.feed();
+        // Set NTP network APN parameters
+        self.send_at_cmd_wait_resp_n(
+            ctx,
+            b"AT+SAPBR=3,1,\"APN\",\"internet.mts.ru\"\n",
+            b"OK\r",
+            50,
+            10,
+            3,
+        )?;
+        // write_log(b"APN is OK");
+        self.send_at_cmd_wait_resp_n(ctx, b"AT+SAPBR=3,1,\"USER\",\"mts\"\n", b"OK\r", 50, 10, 3)?;
+        // write_log(b"USER is OK");
+        self.send_at_cmd_wait_resp_n(ctx, b"AT+SAPBR=3,1,\"PWD\",\"mts\"\n", b"OK\r", 50, 10, 3)?;
+        // write_log(b"PWD is OK");
+        // Activate the network scene
+        self.send_at_cmd_wait_resp_n(ctx, b"AT+SAPBR=1,1\n", b"OK\r", 100, 10, 3)?;
+        // write_log(b"SAPBR is OK");
+        ctx.watchdog.feed();
+        // Obtain a local IP address
+        self.send_at_cmd_wait_resp_n(ctx, b"AT+SAPBR=2,1\n", b"+SAPBR: 1,1", 100, 10, 3)?;
+        // write_log(b"IP is OK");
+        ctx.watchdog.feed();
+        // Set up NTP server
+        self.send_at_cmd_wait_resp_n(ctx, b"AT+CNTP=\"pool.ntp.org\",12\n", b"OK\r", 100, 10, 3)?;
+        // write_log(b"CNTP is OK");
+        // Enable network time synchronization
+        self.send_at_cmd_wait_resp_n(ctx, b"AT+CNTP\n", b"+CNTP: 1", 1000, 300, 3)?;
+        // write_log(b"+CNTP: 1 is OK");
+        ctx.watchdog.feed();
+        self.sync_clk_close(ctx)
+    }
+
+    pub fn sync_clk_close(&mut self, ctx: &mut Context) -> Result<(), Error> {
+        // Deactivate the network scene
+        self.send_at_cmd_wait_resp_n(ctx, b"AT+SAPBR=0,1\n", b"OK\r", 100, 10, 3)
+    }
+
+    pub fn clk(&mut self, ctx: &mut Context) -> Result<Vec<u8, 60>, Error> {
+        // Get local time +CCLK:YY/MM/DD,HH：mm：SS+12 (+CCLK: "YY/MM/DD,HH：mm：SS+32")
+        self.send_at_cmd_wait_resp_n(ctx, b"AT+CCLK?\n", b"+CCLK:", 100, 10, 3)?;
+        // write_log(b"+CCLK: is OK");
+        // parse for DATETIME
+        let mut found = false;
+        let mut subdt: Vec<u8, 60> = Vec::new();
+        for sub in &self.rcv_buf {
+            if sub == &b'"' {
+                if found {
+                    break;
+                }
+                found = true;
+                continue;
+            }
+            if found && subdt.len() < 60 {
+                //copy chars from SIM800 reply
+                subdt.push(*sub).unwrap();
+            }
+        }
+        write_log(b"Datetime: ");
+        write_log(&subdt);
+        Ok(subdt)
+    }
 }

@@ -40,6 +40,8 @@ use stm32f1xx_hal::{
 //use cortex_m_semihosting::hio;  //  For displaying messages on the debug console.
 
 use cortex_m::asm::delay;
+use hd44780_driver::*;
+use shared_bus::*;
 use stm32f1xx_hal::pac::{Interrupt, NVIC};
 use stm32f1xx_hal::usb::{Peripheral, UsbBus};
 use usb_device::prelude::*;
@@ -203,7 +205,7 @@ fn main() -> ! {
     let at_timer = Timer::tim3(dp.TIM3, &clocks, &mut rcc.apb1).start_count_down(100.hz());
 
     // Create a delay timer from the RCC clocks
-    let delay = Delay::new(cp.SYST, clocks);
+    let mut delay = Delay::new(cp.SYST, clocks);
 
     // ШИМ канал для работы пищалки
     let beeper = {
@@ -217,12 +219,12 @@ fn main() -> ! {
         pwm
     };
 
-    // I2C setup for EEPROM
-    let i2c = {
+    // I2C setup for EEPROM & LCD
+    let bus_i2c = {
         let scl = gpiob.pb6.into_alternate_open_drain(&mut gpiob.crl);
         let sda = gpiob.pb7.into_alternate_open_drain(&mut gpiob.crl);
 
-        BlockingI2c::i2c1(
+        let i2c = BlockingI2c::i2c1(
             dp.I2C1,
             (scl, sda),
             &mut afio.mapr,
@@ -236,14 +238,29 @@ fn main() -> ! {
             10,
             1000,
             1000,
-        )
+        );
+        BusManagerSimple::new(i2c)
     };
 
     // Настройка работы чипа EEPROM
     let eeprom = {
         let address = SlaveAddr::default();
-        Eeprom24x::new_24x16(i2c, address)
+        Eeprom24x::new_24x16(bus_i2c.acquire_i2c(), address) // на модуле arduino 24x32
     };
+
+    const I2C_ADDRESS: u8 = 0x27;
+    let mut lcd = HD44780::new_i2c(bus_i2c.acquire_i2c(), I2C_ADDRESS, &mut delay).unwrap();
+    lcd.reset(&mut delay).ok();
+    lcd.clear(&mut delay).ok();
+    lcd.set_display_mode(
+        DisplayMode {
+            display: Display::On,
+            cursor_visibility: Cursor::Visible,
+            cursor_blink: CursorBlink::On,
+        },
+        &mut delay,
+    ).ok();
+    lcd.write_bytes(b"Booting...", &mut delay).ok();
 
     // Настройка сторожевого таймера
     let mut watchdog = IndependentWatchdog::new(dp.IWDG);
@@ -317,7 +334,7 @@ fn main() -> ! {
     let mut balance_wait = false;
     loop {
         // сбрасываем сторожевой таймер
-        ctx.watchdog.feed(); 
+        ctx.watchdog.feed();
         // проверяем связь с SIM800L Если нет, то пробуем перегрузить SIM800
         // если не помогает перезагрузка, пробуем перегрузить микроконтроллер
         let chk = sim800.check_com(&mut ctx);
@@ -391,6 +408,31 @@ fn main() -> ! {
 
             SEC_COUNT_SENSOR.store(0, Ordering::Relaxed); // сбрасываем таймер
             ctx.watchdog.feed();
+
+            // обновляем инфо на экране LCD
+            lcd.reset(&mut ctx.delay).ok();
+            lcd.clear(&mut ctx.delay).ok();
+            lcd.set_display_mode(
+                DisplayMode {
+                    display: Display::On,
+                    cursor_visibility: Cursor::Visible,
+                    cursor_blink: CursorBlink::On,
+                },
+                &mut ctx.delay,
+            ).ok();
+            let temp_ext = temp_control.get_temp();
+            let mut line: Vec<u8, 20> = Vec::new();
+            write!(line, "Temp={0:.1}C", temp_ext).unwrap();
+            lcd.write_bytes(&line, &mut ctx.delay).ok();
+            // переходим на всторую строку
+            lcd.set_cursor_pos(40, &mut ctx.delay).ok();
+            line.clear();
+            let datetime = sim800.clk(&mut ctx).unwrap_or_else(|_| {
+                let mut err: Vec<u8, 60> = Vec::new();
+                err.extend_from_slice(b"Bad date").unwrap();
+                err
+            });
+            lcd.write_bytes(&datetime, &mut ctx.delay).ok();        
         }
         // проверка диапазонов значений температуры и напряжения
         //v220control.check(&mut ctx, &mut sim800);
@@ -404,6 +446,9 @@ fn main() -> ! {
             write_log(b"Alarm triggered");
             need_sms = true;
             ctx.reset_rtc();
+            // пробуем раз в сутки синхронизировать часы через NTP
+            sim800.sync_clk(&mut ctx).ok();
+            sim800.sync_clk_close(&mut ctx).ok();
         }
 
         // 10 секунд ждем входящего звонка и при этом мигаем светодиодом
@@ -425,7 +470,7 @@ fn main() -> ! {
                     // команда перезагрузки МК по сторожевому таймеру
                     if command.starts_with(b"Boot") {
                         write_log(b"Boot command!");
-                        loop {};
+                        loop {}
                     }
                     // команда отсылки статусного СМС, но
                     // без сброса суточного таймера как при звонке
@@ -475,8 +520,25 @@ fn main() -> ! {
                         write_log(b"Balance command!");
                         sim800.send_sms(&mut ctx, b"11", Balance).ok();
                         // сбрасываем таймер ожидания СМС с балансом
-                        SEC_COUNT_SENSOR.store(0, Ordering::Relaxed); 
+                        SEC_COUNT_SENSOR.store(0, Ordering::Relaxed);
                         balance_wait = true;
+                        ctx.beep();
+                    }
+                    // команда синхронизации времени с МТС
+                    if command.starts_with(b"Clk") {
+                        write_log(b"Clk command!");
+                        let sync_result = sim800.sync_clk(&mut ctx);
+                        sim800.sync_clk_close(&mut ctx).ok();
+                        match sync_result {
+                            Err(_) => {
+                                sim800.send_sms(&mut ctx, b"Sync failed", Normal).ok();
+                                write_log(b"Sync failed");
+                            }
+                            Ok(_) => {
+                                sim800.send_sms(&mut ctx, b"Sync OK", Normal).ok();
+                                write_log(b"Sync OK");
+                            }
+                        }
                         ctx.beep();
                     }
                 }
@@ -512,7 +574,9 @@ fn main() -> ! {
                         core::str::from_utf8(&balance).unwrap()
                     )
                     .unwrap();
-                    sim800.send_sms(&mut ctx, sms_message.as_slice(), Normal).ok();
+                    sim800
+                        .send_sms(&mut ctx, sms_message.as_slice(), Normal)
+                        .ok();
                 }
             }
         }
@@ -525,6 +589,11 @@ fn main() -> ! {
             let v220 = v220control.get_voltage();
             let batt = battery.get_voltage();
             let ups_ans = ups.get_ups();
+            let datetime = sim800.clk(&mut ctx).unwrap_or_else(|_| {
+                let mut err: Vec<u8, 60> = Vec::new();
+                err.extend_from_slice(b"Bad date").unwrap();
+                err
+            });
 
             let mut sms_message: Vec<u8, 160> = Vec::new();
             writeln!(sms_message, "T1={}C", temp_int).unwrap();
@@ -533,11 +602,14 @@ fn main() -> ! {
             writeln!(sms_message, "V12={0:.2}V", batt).unwrap();
             write!(
                 sms_message,
-                "UPS={}",
-                core::str::from_utf8(&ups_ans).unwrap()
+                "UPS={}\n {}",
+                core::str::from_utf8(&ups_ans).unwrap(),
+                core::str::from_utf8(&datetime).unwrap()
             )
             .unwrap();
-            sim800.send_sms(&mut ctx, sms_message.as_slice(), Normal).ok();
+            sim800
+                .send_sms(&mut ctx, sms_message.as_slice(), Normal)
+                .ok();
         }
     }
 }

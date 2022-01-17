@@ -1,5 +1,6 @@
 use stm32f1xx_hal::prelude::*;
 //
+use shared_bus::*;
 use stm32f1xx_hal::pac;
 use stm32f1xx_hal::timer::CountDownTimer;
 use stm32f1xx_hal::{delay::Delay, pwm::Channel, rtc::Rtc, watchdog::IndependentWatchdog};
@@ -9,7 +10,7 @@ use crate::sim800l::Sim800;
 use crate::traits::Observable;
 
 /// Определение структуры аппаратного контекста
-pub struct Context {
+pub struct Context<'a> {
     /// сторожевой таймер
     pub watchdog: IndependentWatchdog,
     /// функции задержки
@@ -24,16 +25,21 @@ pub struct Context {
     >,
     /// доступ к EEPROM
     pub eeprom: eeprom24x::Eeprom24x<
-        stm32f1xx_hal::i2c::BlockingI2c<
-            pac::I2C1,
-            (
-                stm32f1xx_hal::gpio::gpiob::PB6<
-                    stm32f1xx_hal::gpio::Alternate<stm32f1xx_hal::gpio::OpenDrain>,
+        I2cProxy<
+            'a,
+            NullMutex<
+                stm32f1xx_hal::i2c::BlockingI2c<
+                    pac::I2C1,
+                    (
+                        stm32f1xx_hal::gpio::gpiob::PB6<
+                            stm32f1xx_hal::gpio::Alternate<stm32f1xx_hal::gpio::OpenDrain>,
+                        >,
+                        stm32f1xx_hal::gpio::gpiob::PB7<
+                            stm32f1xx_hal::gpio::Alternate<stm32f1xx_hal::gpio::OpenDrain>,
+                        >,
+                    ),
                 >,
-                stm32f1xx_hal::gpio::gpiob::PB7<
-                    stm32f1xx_hal::gpio::Alternate<stm32f1xx_hal::gpio::OpenDrain>,
-                >,
-            ),
+            >,
         >,
         eeprom24x::page_size::B16,
         eeprom24x::addr_size::OneByte,
@@ -49,7 +55,7 @@ pub struct Context {
     >,
 }
 
-impl Context {
+impl<'a> Context<'a> {
     pub fn beep(&mut self) {
         self.beeper
             .set_duty(Channel::C1, self.beeper.get_max_duty() / 2);
